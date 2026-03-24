@@ -14,86 +14,76 @@ const io = new Server(server, {
 app.use(cors());
 app.use(express.json());
 
-setInterval(async () => {
+//
+// 🟢 SERVER STATUS (para el frontend)
+//
+app.get("/server-status", (req, res) => {
+  res.json({ status: "online" });
+});
+
+//
+// ❤️ HEARTBEAT
+//
+app.post("/heartbeat", async (req, res) => {
   try {
-    const now = new Date();
-    const limit = new Date(now.getTime() - 15000);
+    const { rustdesk_id } = req.body;
+
+    if (!rustdesk_id) return res.sendStatus(400);
 
     const { data, error } = await supabase
       .from("devices")
-      .select("id, last_seen");
+      .select("*")
+      .eq("rustdesk_id", rustdesk_id)
+      .maybeSingle();
 
-    if (error) return;
-
-    for (const device of data) {
-      if (!device.last_seen) continue;
-
-      const lastSeen = new Date(device.last_seen);
-
-      if (lastSeen < limit) {
-        await supabase
-          .from("devices")
-          .update({ status: "offline" })
-          .eq("id", device.id);
-      }
+    if (error) {
+      console.error("Heartbeat error:", error.message);
+      return res.sendStatus(500);
     }
+
+
+    // 🟢 actualizar estado
+    await supabase
+      .from("devices")
+      .update({
+        last_seen: new Date(),
+        status: "online"
+      })
+      .eq("rustdesk_id", rustdesk_id);
+
+    res.json({ active: true });
 
   } catch (err) {
-    console.error("Offline checker error:", err.message);
+    console.error("Heartbeat crash:", err.message);
+    res.sendStatus(500);
   }
-}, 10000);
-
-app.post("/heartbeat", async (req, res) => {
-  const { rustdesk_id } = req.body;
-
-  const { data } = await supabase
-    .from("devices")
-    .select("*")
-    .eq("rustdesk_id", rustdesk_id)
-    .maybeSingle();
-
-  if (!data || data.pending_delete) {
-    if (data?.pending_delete) {
-      await supabase
-        .from("devices")
-        .delete()
-        .eq("rustdesk_id", rustdesk_id);
-
-      io.emit("devices:update");
-    }
-
-    return res.json({ active: false });
-  }
-
-  await supabase
-    .from("devices")
-    .update({ last_seen: new Date(), status: "online" })
-    .eq("rustdesk_id", rustdesk_id);
-
-  res.json({ active: true });
 });
 
-
+//
+// 🔐 AUTH
+//
 const authMiddleware = async (req, res, next) => {
-  const authHeader = req.headers.authorization;
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) return res.sendStatus(401);
 
-  if (!authHeader) return res.sendStatus(401);
+    const token = authHeader.split(" ")[1];
+    if (!token) return res.sendStatus(401);
 
-  const token = authHeader.split(" ")[1];
+    const { data, error } = await supabase.auth.getUser(token);
 
-  if (!token) return res.sendStatus(401);
+    if (error || !data.user) return res.sendStatus(403);
 
-  const { data, error } = await supabase.auth.getUser(token);
-
-  if (error || !data.user) {
-    return res.sendStatus(403);
+    req.user = data.user;
+    next();
+  } catch (err) {
+    res.sendStatus(500);
   }
-
-  req.user = data.user;
-  next();
 };
 
-
+//
+// 📥 REGISTER DEVICE
+//
 app.post("/register-device", async (req, res) => {
   try {
     const { name, rustdesk_id } = req.body;
@@ -111,7 +101,7 @@ app.post("/register-device", async (req, res) => {
     if (existing) {
       await supabase
         .from("devices")
-        .update({ name, password: req.body.password }) 
+        .update({ name, password: req.body.password })
         .eq("rustdesk_id", rustdesk_id);
 
       io.emit("devices:update");
@@ -123,7 +113,8 @@ app.post("/register-device", async (req, res) => {
         name,
         rustdesk_id,
         password: req.body.password,
-        status: "online"
+        status: "online",
+        last_seen: new Date()
       }
     ]);
 
@@ -134,55 +125,68 @@ app.post("/register-device", async (req, res) => {
 
     io.emit("devices:update");
     res.json({ success: true });
+
   } catch (err) {
     res.status(500).json({ error: "Error registrando dispositivo" });
   }
 });
 
-
+//
+// 📡 GET DEVICES
+//
 app.get("/devices", authMiddleware, async (req, res) => {
-  const { data, error } = await supabase.from("devices").select("*");
+  try {
+    const { data, error } = await supabase.from("devices").select("*");
 
-  if (error) return res.status(500).json(error);
+    if (error) return res.status(500).json(error);
 
-  const now = Date.now();
+    const now = Date.now();
 
-  const devices = data.map(d => {
-    if (!d.last_seen) {
-      return { ...d, status: "offline" };
-    }
+    const devices = data.map(d => {
+      if (!d.last_seen) {
+        return { ...d, status: "offline" };
+      }
 
-    const diff = now - new Date(d.last_seen).getTime();
+      const diff = now - new Date(d.last_seen).getTime();
 
-    return {
-      ...d,
-      status: diff < 15000 ? "online" : "offline"
-    };
-  });
+      return {
+        ...d,
+        status: diff < 15000 ? "online" : "offline"
+      };
+    });
 
-  res.json(devices);
+    res.json(devices);
+
+  } catch (err) {
+    res.status(500).json({ error: "Error obteniendo dispositivos" });
+  }
 });
 
+//
 
+//
 app.delete("/devices/:id", authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
 
     const { error } = await supabase
       .from("devices")
-      .update({ pending_delete: true })
+      .delete()
       .eq("id", id);
 
     if (error) return res.status(500).json(error);
 
     io.emit("devices:update");
+
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: "Error eliminando dispositivo" });
   }
 });
 
-
+//
+// ✏️ UPDATE
+//
 app.put("/devices/:id", authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
@@ -197,12 +201,15 @@ app.put("/devices/:id", authMiddleware, async (req, res) => {
 
     io.emit("devices:update");
     res.json({ success: true });
+
   } catch (err) {
     res.status(500).json({ error: "Error actualizando dispositivo" });
   }
 });
 
-
+//
+// 🔌 SOCKET
+//
 io.on("connection", (socket) => {
   console.log("Cliente conectado");
 
@@ -220,7 +227,10 @@ io.on("connection", (socket) => {
   });
 });
 
+//
+// 🚀 START
+//
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`Servidor en puerto ${PORT}`);
+  console.log(`Servidor en http://localhost:${PORT}`);
 });
