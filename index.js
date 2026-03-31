@@ -14,6 +14,41 @@ const io = new Server(server, {
 app.use(cors());
 app.use(express.json());
 
+setInterval(async () => {
+  try {
+    const now = new Date();
+    const limit = new Date(now.getTime() - 15000);
+
+    const { data, error } = await supabase
+      .from("devices")
+      .select("id, last_seen, status");
+
+    if (error) return;
+
+    let huboCambio = false;
+
+    for (const device of data) {
+      if (!device.last_seen) continue;
+
+      const lastSeen = new Date(device.last_seen);
+
+      if (lastSeen < limit && device.status !== "offline") {
+        await supabase
+          .from("devices")
+          .update({ status: "offline" })
+          .eq("id", device.id);
+
+        huboCambio = true;
+      }
+    }
+
+    if (huboCambio) io.emit("devices:update");
+
+  } catch (err) {
+    console.error("Offline checker error:", err.message);
+  }
+}, 10000);
+
 app.get("/server-status", (req, res) => {
   res.json({ status: "online" });
 });
@@ -24,24 +59,20 @@ app.post("/heartbeat", async (req, res) => {
 
     if (!rustdesk_id) return res.sendStatus(400);
 
-    const { data, error } = await supabase
+    const { data } = await supabase
       .from("devices")
       .select("*")
       .eq("rustdesk_id", rustdesk_id)
       .maybeSingle();
 
-    if (error) {
-      console.error("Heartbeat error:", error.message);
-      return res.sendStatus(500);
-    }
+    if (!data) return res.json({ active: false });
 
     await supabase
       .from("devices")
-      .update({
-        last_seen: new Date(),
-        status: "online",
-      })
+      .update({ last_seen: new Date(), status: "online" })
       .eq("rustdesk_id", rustdesk_id);
+
+    io.emit("devices:update");
 
     res.json({ active: true });
   } catch (err) {
@@ -124,16 +155,9 @@ app.get("/devices", authMiddleware, async (req, res) => {
     const now = Date.now();
 
     const devices = data.map((d) => {
-      if (!d.last_seen) {
-        return { ...d, status: "offline" };
-      }
-
+      if (!d.last_seen) return { ...d, status: "offline" };
       const diff = now - new Date(d.last_seen).getTime();
-
-      return {
-        ...d,
-        status: diff < 15000 ? "online" : "offline",
-      };
+      return { ...d, status: diff < 15000 ? "online" : "offline" };
     });
 
     res.json(devices);
@@ -151,7 +175,6 @@ app.delete("/devices/:id", authMiddleware, async (req, res) => {
     if (error) return res.status(500).json(error);
 
     io.emit("devices:update");
-
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: "Error eliminando dispositivo" });
@@ -186,12 +209,8 @@ io.on("connection", (socket) => {
   };
 
   sendDevices();
-
   socket.on("refresh", sendDevices);
-
-  socket.on("disconnect", () => {
-    console.log("Cliente desconectado");
-  });
+  socket.on("disconnect", () => console.log("Cliente desconectado"));
 });
 
 const PORT = process.env.PORT || 3000;
